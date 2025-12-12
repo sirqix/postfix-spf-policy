@@ -1,0 +1,12 @@
+[Unit]
+Description=Postfix SPF Policy Server
+After=network.target mysql.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/postfix-spf-policy --config /etc/postfix/postfix-spf-policy.conf
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

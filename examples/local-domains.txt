@@ -1,0 +1,12 @@
+# Local domains file
+# One domain per line
+# Lines starting with # are comments
+#
+# Copy to /etc/postfix/local-domains.txt
+# These are your mail server's local domains - SPF checks will be
+# skipped for senders from these domains.
+
+# Example:
+# example.com
+# mail.example.com
+# subdomain.example.com

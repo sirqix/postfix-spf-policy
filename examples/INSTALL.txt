@@ -1,0 +1,53 @@
+Postfix SPF Policy Server Installation Guide
+=============================================
+
+1. Build the binary (static, no glibc dependency):
+   cd /path/to/postfix-spf-policy
+   CGO_ENABLED=0 go build -ldflags="-s -w" -o postfix-spf-policy ./cmd/postfix-spf-policy
+
+2. Install the binary:
+   sudo cp postfix-spf-policy /usr/local/bin/
+   sudo chmod +x /usr/local/bin/postfix-spf-policy
+
+3. Install configuration:
+   sudo cp deploy/postfix-spf-policy.conf /etc/postfix/
+
+4. Configure postfix-spf-policy.conf:
+   sudo vim /etc/postfix/postfix-spf-policy.conf
+
+   # Set your domain source (MySQL config or flat file):
+   domains_database_config = /etc/postfix/mysql/virtual_mailbox_domains.cf
+
+5. Install systemd service:
+   sudo cp deploy/postfix-spf-policy.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable postfix-spf-policy
+   sudo systemctl start postfix-spf-policy
+
+6. Configure Postfix main.cf:
+   Add to /etc/postfix/main.cf:
+
+   smtpd_recipient_restrictions =
+       ...
+       check_policy_service inet:127.0.0.1:10033
+       ...
+
+7. Reload Postfix:
+   sudo systemctl reload postfix
+
+8. Check status:
+   sudo systemctl status postfix-spf-policy
+
+   # View logs:
+   sudo journalctl -u postfix-spf-policy -f
+
+   # Get statistics:
+   sudo kill -USR1 $(pgrep postfix-spf-policy)
+
+Troubleshooting
+---------------
+- Check if the server is listening:
+  ss -tlnp | grep 10033
+
+- Test manually:
+  echo -e "request=smtpd_access_policy\nclient_address=8.8.8.8\nsender=test@google.com\nhelo_name=mail.google.com\nrecipient=user@example.com\n" | nc 127.0.0.1 10033

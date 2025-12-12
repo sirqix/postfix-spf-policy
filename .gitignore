@@ -1,0 +1,28 @@
+# Claude Code local settings
+.claude/
+
+# Build artifacts
+postfix-spf-policy
+postfix-spf-policy-installer.run
+spf-check
+domain-check
+
+# Editor files
+*~
+*.swp
+*.swo
+.*.swp
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test/temp files
+*.log
+*.tmp
+testdata/

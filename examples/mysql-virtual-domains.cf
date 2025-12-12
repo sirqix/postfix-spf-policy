@@ -1,0 +1,16 @@
+# Postfix-style MySQL configuration for local domains
+# Copy to /etc/postfix/mysql-virtual-domains.cf
+#
+# This file is used by spf-policy-server to load local domains
+# from the same database Postfix uses for virtual mailboxes.
+
+# MySQL connection settings
+hosts = localhost
+user = postfix
+password = YOUR_PASSWORD_HERE
+dbname = mail
+
+# Query to get all domains
+# The query should return one column: the domain name
+# The %s placeholder is stripped when loading all domains
+query = SELECT domain FROM virtual_domains WHERE domain='%s'
