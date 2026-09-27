@@ -38,7 +38,11 @@ type Config struct {
 	TolerantMode bool
 
 	// Logging
-	LogLevel string
+	LogLevel  string
+	LogTarget string // "auto", "syslog", "stderr", "stdout"
+
+	// Cache stats logging interval (0 = disabled)
+	CacheStatsInterval time.Duration
 
 	// PID file
 	PidFile string
@@ -50,19 +54,21 @@ type Config struct {
 // Default returns a Config with default values.
 func Default() *Config {
 	return &Config{
-		ListenAddress:     "127.0.0.1",
-		ListenPort:        10033,
-		CacheMaxSize:      10000,
-		CacheTTL:          5 * time.Minute,
-		DNSTimeout:        10 * time.Second,
-		DNSRetries:        2,
+		ListenAddress:         "127.0.0.1",
+		ListenPort:            10033,
+		CacheMaxSize:          10000,
+		CacheTTL:              5 * time.Minute,
+		DNSTimeout:            10 * time.Second,
+		DNSRetries:            2,
 		DomainsDatabaseConfig: "",
 		DomainsFile:           "",
-		ReloadInterval:    5 * time.Minute,
-		TolerantMode:      true, // Enabled by default
-		LogLevel:          "info",
-		PidFile:           "/var/run/spf-policy.pid",
-		ConnectionTimeout: 30 * time.Second,
+		ReloadInterval:        5 * time.Minute,
+		TolerantMode:          true, // Enabled by default
+		LogLevel:              "info",
+		LogTarget:             "auto",
+		CacheStatsInterval:    10 * time.Minute,
+		PidFile:               "/var/run/spf-policy.pid",
+		ConnectionTimeout:     30 * time.Second,
 	}
 }
 
@@ -165,6 +171,14 @@ func (c *Config) set(key, value string) error {
 		c.TolerantMode = parseBool(value)
 	case "log_level":
 		c.LogLevel = value
+	case "log_target":
+		c.LogTarget = value
+	case "cache_stats_interval":
+		interval, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("invalid cache_stats_interval: %w", err)
+		}
+		c.CacheStatsInterval = time.Duration(interval) * time.Second
 	case "pidfile":
 		c.PidFile = value
 	case "connection_timeout":

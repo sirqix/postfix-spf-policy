@@ -3,6 +3,7 @@ package policy
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,28 +16,29 @@ import (
 	"postfix-spf-policy/internal/cache"
 	"postfix-spf-policy/internal/domains"
 	"postfix-spf-policy/internal/evaluator"
+	"postfix-spf-policy/internal/logging"
 	"postfix-spf-policy/internal/whitelist"
 )
 
 // Request represents a Postfix policy request.
 type Request struct {
-	Request           string
-	ProtocolState     string
-	ProtocolName      string
-	ClientAddress     string
-	ClientName        string
-	ClientPort        string
-	ReverseClientName string
-	HeloName          string
-	Sender            string
-	Recipient         string
-	RecipientCount    string
-	QueueID           string
-	Instance          string
-	Size              string
-	SaslMethod        string
-	SaslUsername      string
-	SaslSender        string
+	Request            string
+	ProtocolState      string
+	ProtocolName       string
+	ClientAddress      string
+	ClientName         string
+	ClientPort         string
+	ReverseClientName  string
+	HeloName           string
+	Sender             string
+	Recipient          string
+	RecipientCount     string
+	QueueID            string
+	Instance           string
+	Size               string
+	SaslMethod         string
+	SaslUsername       string
+	SaslSender         string
 	EncryptionProtocol string
 	EncryptionCipher   string
 	EncryptionKeysize  string
@@ -249,9 +251,14 @@ func (h *Handler) ProcessRequest(req *Request) (string, string) {
 		SPFResult: spfResultString(result.SPFResult),
 	})
 
-	h.logger.Debug("evaluated",
+	// Per-request decision logged at Verbose so operators can correlate with
+	// Postfix mail.log entries via queue_id without enabling full debug noise.
+	h.logger.Log(context.Background(), logging.LevelVerbose, "evaluated",
+		"queue_id", req.QueueID,
 		"ip", req.ClientAddress,
 		"sender", req.Sender,
+		"helo", req.HeloName,
+		"recipient", req.Recipient,
 		"action", result.Action,
 		"spf", spfResultString(result.SPFResult),
 		"tolerant", result.Tolerant,

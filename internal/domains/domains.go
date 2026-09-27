@@ -226,11 +226,46 @@ func (l *Loader) LoadFromFile(path string) error {
 	return nil
 }
 
-// IsLocal checks if a domain is in the local domains list.
+// IsLocal reports whether domain is one of our hosted domains, or any
+// subdomain of one.
+//
+// The subdomain walk is a security requirement, not a convenience. SPF has no
+// subdomain inheritance: a "v=spf1 ... -all" record on example.net says nothing
+// about mail.example.net, and hosts generally publish no SPF record for their
+// subdomains. So when this returned a bare map hit, an external client could
+// use MAIL FROM:<anything@mx-1.hostedbyexample.net> — not an exact
+// hosted domain, therefore "not local" — fall through to a normal SPF
+// evaluation, find no record to fail against, and be accepted. That defeated
+// the local-domain spoof check for every subdomain of all hosted domains.
+//
+// Walking up the labels closes it: the sender domain is local if it equals a
+// hosted domain or sits underneath one at any depth. Cost is one map lookup per
+// label, so it stays O(labels) with no allocation.
 func (l *Loader) IsLocal(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	// Tolerate a fully-qualified trailing dot ("example.net." == "example.net").
+	d = strings.TrimSuffix(d, ".")
+	if d == "" {
+		return false
+	}
+
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return l.domains[strings.ToLower(domain)]
+
+	if l.domains[d] {
+		return true
+	}
+	// Strip one leading label at a time and retest the parent.
+	for {
+		i := strings.IndexByte(d, '.')
+		if i < 0 {
+			return false
+		}
+		d = d[i+1:]
+		if l.domains[d] {
+			return true
+		}
+	}
 }
 
 // Reload reloads domains from the configured source.
@@ -290,12 +325,50 @@ func convertToGetAllQuery(originalQuery string) string {
 		// Remove WHERE clause and everything after it
 		// But preserve the basic SELECT ... FROM ... structure
 		processed := removeWhereClause(part)
+		// The Postfix lookup query ends in "LIMIT 1" (it expects a single
+		// domain match). removeWhereClause strips the WHERE domain='%s'
+		// predicate but leaves the trailing LIMIT, which would cap the
+		// get-all preload at one row — so IsLocal() would recognise only a
+		// single hosted domain and the local-domain spoof check would miss
+		// all the others. Strip the LIMIT so every hosted domain loads.
+		processed = stripTrailingLimit(processed)
 		if processed != "" {
 			resultParts = append(resultParts, processed)
 		}
 	}
 
 	return strings.Join(resultParts, " UNION ")
+}
+
+// stripTrailingLimit removes a "LIMIT n" / "LIMIT a,b" / "LIMIT n OFFSET m"
+// clause, preserving any trailing ')' that closes a parenthesized SELECT.
+// Only a genuine numeric LIMIT clause is removed (digits, commas, whitespace,
+// and an optional OFFSET keyword) so a column/alias that merely contains the
+// letters "limit" is left untouched.
+func stripTrailingLimit(query string) string {
+	idx := strings.LastIndex(strings.ToUpper(query), " LIMIT ")
+	if idx == -1 {
+		return query
+	}
+	j := idx + len(" LIMIT ")
+	end := j
+	for end < len(query) {
+		c := query[end]
+		if (c >= '0' && c <= '9') || c == ',' || c == ' ' || c == '\t' {
+			end++
+			continue
+		}
+		if end+6 <= len(query) && strings.EqualFold(query[end:end+6], "OFFSET") {
+			end += 6
+			continue
+		}
+		break
+	}
+	// Bail if the token after LIMIT wasn't actually a numeric clause.
+	if strings.TrimSpace(query[j:end]) == "" {
+		return query
+	}
+	return strings.TrimSpace(query[:idx]) + query[end:]
 }
 
 // splitByUnion splits a query by UNION keyword (case-insensitive).

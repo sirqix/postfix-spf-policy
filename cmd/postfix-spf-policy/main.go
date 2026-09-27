@@ -23,6 +23,7 @@ import (
 	"postfix-spf-policy/internal/config"
 	"postfix-spf-policy/internal/domains"
 	"postfix-spf-policy/internal/evaluator"
+	"postfix-spf-policy/internal/logging"
 	"postfix-spf-policy/internal/policy"
 	"postfix-spf-policy/internal/whitelist"
 )
@@ -48,7 +49,8 @@ func main() {
 	// Command line flags
 	configFile := flag.String("config", defaultConfig, "Configuration file")
 	foreground := flag.Bool("foreground", false, "Run in foreground")
-	verbose := flag.Bool("verbose", false, "Verbose logging")
+	verbose := flag.Bool("verbose", false, "Verbose logging (per-request decisions)")
+	debugFlag := flag.Bool("debug", false, "Debug logging (everything, including cache traces)")
 	showVersion := flag.Bool("version", false, "Show version")
 	showHelp := flag.Bool("help", false, "Show help")
 	flag.Parse()
@@ -63,23 +65,18 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Set up logging
-	logLevel := slog.LevelInfo
-	if *verbose {
-		logLevel = slog.LevelDebug
+	// Set up an early stderr-backed logger so we can report config load errors
+	// before we know the configured log_target. The real logger is built once
+	// the config is loaded (which can switch us to syslog).
+	var levelVar slog.LevelVar
+	levelVar.Set(slog.LevelInfo)
+	switch {
+	case *debugFlag:
+		levelVar.Set(slog.LevelDebug)
+	case *verbose:
+		levelVar.Set(logging.LevelVerbose)
 	}
-
-	var logger *slog.Logger
-	if *foreground {
-		logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: logLevel,
-		}))
-	} else {
-		// For daemon mode, log to syslog would be better, but for now use stderr
-		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level: logLevel,
-		}))
-	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, textHandlerOptions(&levelVar)))
 
 	// Load configuration
 	cfg, err := config.Load(*configFile)
@@ -94,9 +91,17 @@ func main() {
 		}
 	}
 
-	// Override log level from config
-	if cfg.LogLevel == "debug" {
-		logLevel = slog.LevelDebug
+	// Apply log_level from config (CLI --debug/--verbose still win on startup).
+	if !*verbose && !*debugFlag {
+		if lvl, ok := logging.ParseLevel(cfg.LogLevel); ok {
+			levelVar.Set(lvl)
+		}
+	}
+
+	// Build the real logger based on log_target + foreground.
+	logger, syslogClose := buildLogger(cfg.LogTarget, *foreground, &levelVar, logger)
+	if syslogClose != nil {
+		defer syslogClose()
 	}
 
 	// Initialize cache
@@ -188,6 +193,16 @@ func main() {
 				} else {
 					// Update tolerant mode from config
 					eval.SetTolerantMode(newCfg.TolerantMode)
+					// Update log level from config (overrides startup --verbose/--debug).
+					if lvl, ok := logging.ParseLevel(newCfg.LogLevel); ok {
+						old := levelVar.Level()
+						levelVar.Set(lvl)
+						if old != lvl {
+							logger.Info("log level updated", "old", logging.LevelString(old), "new", logging.LevelString(lvl))
+						}
+					} else if newCfg.LogLevel != "" {
+						logger.Warn("invalid log_level in config, keeping current", "value", newCfg.LogLevel)
+					}
 				}
 				// Reload domains
 				if err := domainLoader.Reload(); err != nil {
@@ -223,6 +238,32 @@ func main() {
 			}
 		}
 	}()
+
+	// Periodic cache stats logging goroutine. Emits one structured Info-level
+	// line per interval so operators can observe hit rate over time. Disabled
+	// when cache_stats_interval is 0.
+	if cfg.CacheStatsInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(cfg.CacheStatsInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					s := spfCache.Stats()
+					logger.Info("cache stats",
+						"size", s.Size,
+						"hits", s.Hits,
+						"misses", s.Misses,
+						"expired", s.Expired,
+						"evicted", s.Evicted,
+						"hit_rate_pct", fmt.Sprintf("%.1f", s.HitRate),
+					)
+				}
+			}
+		}()
+	}
 
 	// Periodic domain reload goroutine
 	if cfg.ReloadInterval > 0 && (cfg.DomainsDatabaseConfig != "" || cfg.DomainsFile != "") {
@@ -294,6 +335,58 @@ func main() {
 	}
 }
 
+// buildLogger constructs the runtime logger based on log_target. Returns the
+// logger and an optional close function for the syslog connection (nil if
+// none was opened). target accepts: "auto", "syslog", "stderr", "stdout".
+// "auto" picks syslog in daemon mode and stderr in foreground mode.
+// On syslog open failure, falls back to stderr and logs a warning via tmp.
+// textHandlerOptions returns the slog options used for every stderr/stdout
+// text handler we build. The ReplaceAttr drops the per-record timestamp
+// (syslog and journald already stamp lines, and stderr in --foreground is
+// for humans who don't need it) and renders LevelVerbose as "VERBOSE"
+// instead of slog's default "DEBUG+2".
+func textHandlerOptions(level slog.Leveler) *slog.HandlerOptions {
+	return &slog.HandlerOptions{
+		Level: level,
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if len(groups) == 0 && a.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			if a.Key == slog.LevelKey {
+				if lvl, ok := a.Value.Any().(slog.Level); ok {
+					a.Value = slog.StringValue(logging.LevelString(lvl))
+				}
+			}
+			return a
+		},
+	}
+}
+
+func buildLogger(target string, foreground bool, level *slog.LevelVar, tmp *slog.Logger) (*slog.Logger, func() error) {
+	t := strings.ToLower(strings.TrimSpace(target))
+	if t == "" || t == "auto" {
+		if foreground {
+			t = "stderr"
+		} else {
+			t = "syslog"
+		}
+	}
+	opts := textHandlerOptions(level)
+	switch t {
+	case "syslog":
+		h, err := logging.NewSyslogHandler("postfix-spf-policy", level, os.Stderr)
+		if err != nil {
+			tmp.Warn("failed to open syslog, falling back to stderr", "error", err)
+			return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+		}
+		return slog.New(h), h.Close
+	case "stdout":
+		return slog.New(slog.NewTextHandler(os.Stdout, opts)), nil
+	default: // stderr or unknown
+		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+	}
+}
+
 func printStats(logger *slog.Logger, handler *policy.Handler, eval *evaluator.Evaluator, c *cache.Cache) {
 	uptime := time.Since(startTime)
 	hStats := handler.Stats()
@@ -340,13 +433,14 @@ Usage: postfix-spf-policy [options]
 Options:
   --config FILE     Configuration file (default: /etc/postfix/postfix-spf-policy.conf)
   --foreground      Run in foreground (don't daemonize)
-  --verbose         Enable verbose/debug logging
+  --verbose         Verbose logging (per-request decisions; same as log_level=verbose)
+  --debug           Debug logging (everything; same as log_level=debug)
   --version         Show version
   --help            Show this help
 
 Signals:
   SIGINT/SIGTERM    Graceful shutdown
-  SIGHUP            Reload config, domains, and whitelist
+  SIGHUP            Reload config, domains, whitelist, and log_level
   SIGUSR1           Print statistics
 
 Configuration file format (key=value):
@@ -354,13 +448,20 @@ Configuration file format (key=value):
   listen_port              Port to listen on (default: 10033)
   cache_max_size           Maximum cache entries (default: 10000)
   cache_ttl                Cache TTL in seconds (default: 300)
+  cache_stats_interval     Seconds between cache-stats log lines, 0 disables (default: 600)
   dns_timeout              DNS lookup timeout in seconds (default: 10)
   domains_database_config  Path to Postfix-style MySQL config file for local domains
   domains_file             Path to flat file with local domains (one per line)
   spf_whitelist_file       Path to file with domains that bypass SPF checks
   reload_interval          Interval to reload domains in seconds (default: 300)
   tolerant_mode            Enable tolerant heuristics: yes/no (default: yes)
-  log_level                Log level: debug, info, warn, error (default: info)
+  log_level                debug | verbose | info | warn | error (default: info)
+                             info    -> tolerant overrides + warn/error
+                             verbose -> + per-request pass/fail/defer decisions
+                             debug   -> + cache traces and library debug
+  log_target               auto | syslog | stderr | stdout (default: auto)
+                             auto -> syslog when daemonized, stderr in --foreground
+                             syslog uses LOG_MAIL facility (mixes with Postfix logs)
 
 Example:
   postfix-spf-policy --foreground --verbose --config /etc/postfix/postfix-spf-policy.conf`)

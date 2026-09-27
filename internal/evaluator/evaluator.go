@@ -3,6 +3,7 @@ package evaluator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -12,6 +13,15 @@ import (
 
 	"blitiri.com.ar/go/spf"
 )
+
+// spfRaisedLookupLimit is the DNS-lookup cap used when re-evaluating a sender
+// that hit ErrLookupLimitReached under the default limit of 10. The upstream
+// library over-counts (mechanism + each resolved host + the initial lookup),
+// so legitimate large senders need headroom above 10 without removing the
+// bound entirely (the limit still exists to cap DNS load per evaluation).
+// 20 comfortably covers observed real-world chains (cisco.com counts ~12)
+// while still rejecting genuinely runaway records.
+const spfRaisedLookupLimit = 20
 
 // Result represents the outcome of an SPF evaluation.
 type Result struct {
@@ -112,18 +122,105 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 	// Note: The SPF library returns an error for debugging purposes even on successful checks.
 	// The error indicates which mechanism matched (e.g., "matched ip", "matched mx").
 	// We should only treat it as a real error if the result is TempError or PermError.
+
+	// The upstream library counts DNS lookups more strictly than real-world
+	// consensus: it charges the RFC 7208 §4.6.4 10-lookup budget once per
+	// mx/a mechanism AND once per resolved MX/A host (spf.go:703 + :721),
+	// plus the initial domain lookup. So a large-but-legitimate sender whose
+	// chain uses ~6 term-lookups can be counted at ~12 and trip
+	// ErrLookupLimitReached — returning a spurious PermError before its
+	// terminal `all` is ever evaluated. cisco.com is the canonical case
+	// (v=spf1 redirect=spfa._spf.cisco.com ... mx:res.cisco.com mx:sco.cisco.com ~all);
+	// Gmail/Outlook/pyspf all deliver it. When we see a lookup-limit
+	// PermError, re-run once with a raised limit so the sender's actual
+	// policy (their `all`, or a genuine ip match) decides instead of a
+	// fabricated "invalid syntax / too many lookups" rejection. A real
+	// syntax error, or a chain that genuinely exceeds the raised limit, still
+	// surfaces as PermError and is handled below unchanged.
+	if result == spf.PermError && errors.Is(debugInfo, spf.ErrLookupLimitReached) {
+		r2, d2 := spf.CheckHostWithSender(ip, heloName, identity,
+			spf.WithContext(ctx), spf.OverrideLookupLimit(spfRaisedLookupLimit))
+		if r2 != spf.PermError && r2 != spf.TempError {
+			e.logger.Info("SPF lookup-limit permerror re-evaluated with raised limit",
+				"domain", senderDomain,
+				"ip", clientIP,
+				"sender", sender,
+				"helo", heloName,
+				"raised_limit", spfRaisedLookupLimit,
+				"original", "permerror (lookup limit reached)",
+				"resolved", spfResultString(r2),
+				"note", "upstream lib over-counts mx/a host lookups; real MTAs deliver this sender",
+			)
+			result, debugInfo = r2, d2
+		}
+	}
+
 	if result == spf.TempError {
 		e.tempErrors.Add(1)
 		errMsg := "unknown"
 		if debugInfo != nil {
 			errMsg = debugInfo.Error()
 		}
-		e.logger.Warn("SPF temporary error", "debug", errMsg, "ip", clientIP, "sender", sender)
-		return &Result{
-			Action:    "DEFER",
-			Reason:    fmt.Sprintf("SPF temporary error for %s: %s", senderDomain, errMsg),
-			SPFResult: spf.TempError,
-		}, nil
+
+		// Walk the SPF chain to identify broken include targets so the
+		// operator (and the sender's postmaster, via the bounce DSN) sees
+		// exactly which referenced record is the cause. The upstream library
+		// classifies an NXDOMAIN-during-include as TempError even though it's
+		// functionally a sender-side permanent config error (e.g. lsnc.net
+		// references spf-us.ppe-hosted.com which is NXDOMAIN; the working
+		// name is _spf-us.ppe-hosted.com with the underscore prefix).
+		// We deliberately KEEP the DEFER behavior — RFC 7208 says TempError
+		// → 4xx so the sender keeps retrying, and if they fix the SPF the
+		// next attempt succeeds. We only enrich the diagnostic.
+		brokenIncludes := e.findBrokenIncludes(ctx, senderDomain)
+
+		if len(brokenIncludes) > 0 {
+			parts := make([]string, 0, len(brokenIncludes))
+			for _, bi := range brokenIncludes {
+				parts = append(parts, fmt.Sprintf("%s (%s)", bi.target, bi.cause))
+			}
+			joined := strings.Join(parts, ", ")
+			e.logger.Warn("SPF temporary error: broken include(s) detected",
+				"domain", senderDomain,
+				"ip", clientIP,
+				"sender", sender,
+				"broken_includes", joined,
+				"explanation", "SPF chain references an include target that does not resolve; sender must fix their SPF record",
+			)
+			// Surface the first broken include in the 4xx reason so the
+			// sender's bounce DSN tells the postmaster what to fix.
+			reason := fmt.Sprintf("SPF temporary error for %s: broken include %s (%s) — sender DNS must be fixed",
+				senderDomain, brokenIncludes[0].target, brokenIncludes[0].cause)
+			return &Result{Action: "DEFER", Reason: reason, SPFResult: spf.TempError}, nil
+		}
+
+		// No broken include in the sender's chain: the failure is at the DNS
+		// resolver layer (SERVFAIL / timeout / unreachable authoritative). This
+		// can be EITHER a receiver-side/network condition (local resolver can't
+		// handle the response, authoritative unreachable from this host) OR a
+		// genuinely broken sender domain that fails everywhere. We can't tell
+		// which from a single failed lookup, so the log points the operator at
+		// the discriminating test (compare against a public resolver) rather
+		// than asserting a side. Classify the error so the log carries an
+		// actionable diagnosis instead of a bare "server misbehaving".
+		diag := classifyResolverError(debugInfo)
+		e.logger.Warn("SPF temporary error: DNS resolution failure",
+			"domain", senderDomain,
+			"ip", clientIP,
+			"sender", sender,
+			"helo", heloName,
+			"resolver", diag.server,
+			"error_kind", diag.kind,
+			"raw_error", errMsg,
+			"likely_cause", diag.cause,
+			"operator_action", diag.action,
+			"disposition", "deferred 4xx; sender will retry. Discriminate: if 'dig @1.1.1.1 TXT "+senderDomain+"' also fails, the sender's DNS is broken; if only the local resolver fails, it's receiver-side",
+		)
+		// Keep the SMTP 4xx text generic and non-accusatory: this is our DNS
+		// problem, so we neither blame the sender nor leak our resolver's
+		// address to the outside world via the bounce DSN.
+		reason := fmt.Sprintf("temporary DNS error while validating SPF for %s; please retry", senderDomain)
+		return &Result{Action: "DEFER", Reason: reason, SPFResult: spf.TempError}, nil
 	}
 
 	// Log debug info for all checks
@@ -142,16 +239,26 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 
 	// Apply tolerant heuristics for softfail/fail/permerror (if enabled)
 	if e.tolerantMode.Load() && (result == spf.Fail || result == spf.SoftFail || result == spf.PermError) {
-		// For PermError, first check if IP is directly listed in SPF record
-		// This handles cases where the SPF record has too many DNS lookups
-		// but the IP is explicitly authorized
+		// For PermError, first check if IP is directly listed in SPF record.
+		// Handles two cases the upstream library rejects with PermError:
+		//   1. SPF record exceeded the 10 DNS lookup limit (RFC 7208 §4.6.4).
+		//   2. Domain has multiple v=spf1 TXT records (RFC 7208 §4.5) — we
+		//      treat them as a union: any record authorizing the IP passes.
 		if result == spf.PermError {
-			if ipInSPF, spfRecord := e.checkIPInSPFRecord(ctx, clientIP, senderDomain); ipInSPF {
+			ipInSPF, spfRecords := e.checkIPInSPFRecord(ctx, clientIP, sender, heloName, senderDomain)
+			if ipInSPF {
 				e.tolerantOverrides.Add(1)
 				res.Tolerant = true
 				originalAction := res.Action
 				res.Action = "DUNNO"
-				res.Evidence = []string{fmt.Sprintf("IP %s found in SPF record chain (PermError bypassed due to DNS lookup limit)", clientIP)}
+
+				evidence := fmt.Sprintf("IP %s found in SPF record chain (PermError bypassed)", clientIP)
+				problem := "SPF record exceeded DNS lookup limit but IP is authorized in SPF chain"
+				if len(spfRecords) > 1 {
+					evidence = fmt.Sprintf("IP %s found in SPF record chain (PermError bypassed; %d v=spf1 records present, treated as union)", clientIP, len(spfRecords))
+					problem = fmt.Sprintf("Multiple v=spf1 records (%d) cause PermError; IP is authorized in at least one record", len(spfRecords))
+				}
+				res.Evidence = []string{evidence}
 				res.Reason = fmt.Sprintf("tolerant override: %s", strings.Join(res.Evidence, ", "))
 
 				e.logger.Info("tolerant override applied for PermError",
@@ -161,12 +268,18 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 					"helo", heloName,
 					"spf_result", "permerror",
 					"original_action", originalAction,
-					"problem", "SPF record exceeded DNS lookup limit but IP is authorized in SPF chain",
-					"spf_record", spfRecord,
+					"problem", problem,
+					"spf_record", strings.Join(spfRecords, " || "),
+					"spf_record_count", len(spfRecords),
 					"evidence", strings.Join(res.Evidence, "; "),
 				)
 				return res, nil
 			}
+			// No IP-in-record match — refine the user-visible reason so the
+			// operator sees the actual cause (e.g. multi-record) instead of a
+			// generic "invalid SPF record syntax" string. Heuristics below may
+			// still override this reason with a tolerant pass.
+			res.Reason = permErrorReason(senderDomain, spfRecords)
 		}
 
 		// Apply standard tolerant heuristics
@@ -356,106 +469,517 @@ func getDomainRoot(domain string) string {
 	return domain
 }
 
-// checkIPInSPFRecord checks if an IP is listed in the domain's SPF record or its includes.
-// This is used to bypass PermError when the IP is explicitly authorized but the
-// SPF record has too many DNS lookups.
-func (e *Evaluator) checkIPInSPFRecord(ctx context.Context, clientIP, domain string) (bool, string) {
+// permErrorReason builds a human-readable reason for a PermError that wasn't
+// overridden, using the count of v=spf1 records found at the apex to
+// distinguish the most common causes. The upstream library returns a single
+// PermError constant for all causes; we narrow it for operator clarity.
+func permErrorReason(domain string, records []string) string {
+	switch {
+	case len(records) > 1:
+		return fmt.Sprintf("SPF permanent error for %s: %d v=spf1 records found at apex (RFC 7208 §4.5 requires exactly one — merge them into a single record).", domain, len(records))
+	case len(records) == 0:
+		return fmt.Sprintf("SPF permanent error for %s: no usable v=spf1 record found (referenced include/redirect target may be missing, or DNS may be misconfigured).", domain)
+	default:
+		return fmt.Sprintf("SPF permanent error for %s: invalid mechanism syntax or too many DNS lookups (RFC 7208 §4.6.4 limit is 10 lookups per evaluation).", domain)
+	}
+}
+
+// isSPFRecord returns true if the TXT record is a v=spf1 record (case-insensitive).
+// Accepts both bare "v=spf1" (no mechanisms) and "v=spf1 ..." with mechanisms.
+func isSPFRecord(txt string) bool {
+	lower := strings.ToLower(strings.TrimSpace(txt))
+	return lower == "v=spf1" || strings.HasPrefix(lower, "v=spf1 ")
+}
+
+// spfWalk carries identities needed during a tolerant SPF walk so that
+// macro-bearing mechanisms (currently exists:) can be expanded.
+type spfWalk struct {
+	clientIP     net.IP
+	senderEmail  string // full MAIL FROM, may be empty
+	senderDomain string // domain portion of senderEmail (for %{o})
+	heloName     string
+	visited      map[string]bool
+}
+
+// checkIPInSPFRecord checks if an IP is listed in the domain's SPF record(s) or includes.
+// Used to bypass PermError when the IP is explicitly authorized but the SPF chain
+// has too many DNS lookups, or when the domain has multiple v=spf1 records.
+// Returns the match result and all v=spf1 TXT records found at the apex (for logging).
+func (e *Evaluator) checkIPInSPFRecord(ctx context.Context, clientIP, sender, helo, domain string) (bool, []string) {
 	ip := net.ParseIP(clientIP)
 	if ip == nil {
-		return false, ""
+		return false, nil
 	}
 
-	// Track visited domains to prevent loops
-	visited := make(map[string]bool)
+	walk := &spfWalk{
+		clientIP:     ip,
+		senderEmail:  sender,
+		senderDomain: extractDomain(sender),
+		heloName:     helo,
+		visited:      make(map[string]bool),
+	}
+	records := e.getSPFRecords(ctx, domain)
 
-	// Get main SPF record for logging
-	mainRecord := e.getSPFRecord(ctx, domain)
-
-	// Check with depth limit (RFC 7208 allows 10 lookups, we use 5 for includes to be safe)
-	found := e.checkIPInSPFRecordRecursive(ctx, ip, domain, visited, 5)
-	return found, mainRecord
+	// Depth limit (RFC 7208 allows 10 lookups; we cap include depth at 5 to be safe).
+	found := e.checkIPInSPFRecordRecursive(ctx, walk, domain, 5)
+	return found, records
 }
 
-// getSPFRecord retrieves the SPF record for a domain.
-func (e *Evaluator) getSPFRecord(ctx context.Context, domain string) string {
+// brokenInclude describes an SPF include target that fails to resolve.
+type brokenInclude struct {
+	target string // the include target as written (e.g. "spf-us.ppe-hosted.com")
+	cause  string // short cause: "NXDOMAIN" or "no v=spf1 record"
+}
+
+// findBrokenIncludes walks the SPF chain of `domain` and returns every
+// include target whose TXT lookup yields NXDOMAIN, or whose response is
+// NOERROR but contains no v=spf1 record. Both are functionally permanent
+// sender-side errors that the upstream library classifies as TempError.
+//
+// Walks include depth up to 5 (same cap as checkIPInSPFRecord). Visited
+// targets are tracked to break cycles. The walk does NOT abort on the
+// first failure — we collect all broken nodes so the operator/postmaster
+// sees the full picture.
+//
+// The walk only inspects include: mechanisms; redirect= is followed too,
+// since RFC 7208 §6.1 treats it equivalently for the "doesn't resolve"
+// failure mode.
+func (e *Evaluator) findBrokenIncludes(ctx context.Context, domain string) []brokenInclude {
+	if domain == "" {
+		return nil
+	}
+	visited := make(map[string]bool)
+	var broken []brokenInclude
+	e.walkBrokenIncludes(ctx, domain, visited, &broken, 5)
+	return broken
+}
+
+func (e *Evaluator) walkBrokenIncludes(ctx context.Context, domain string, visited map[string]bool, broken *[]brokenInclude, depth int) {
+	if depth <= 0 {
+		return
+	}
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+	if visited[domain] {
+		return
+	}
+	visited[domain] = true
+
 	txts, err := e.resolver.LookupTXT(ctx, domain)
 	if err != nil {
-		return ""
+		// Caller responsible for top-level — but for recursion this would
+		// only be reached via an include that was already added to broken
+		// at the parent level; don't double-record.
+		return
 	}
 
+	// Walk every v=spf1 record at this domain (typically 1)
 	for _, txt := range txts {
-		if strings.HasPrefix(strings.ToLower(txt), "v=spf1 ") {
-			return txt
+		if !isSPFRecord(txt) {
+			continue
+		}
+		for _, tok := range splitSPFTokens(txt) {
+			low := strings.ToLower(tok)
+			var target string
+			if v, ok := stripMechPrefix(tok, low, "include:"); ok {
+				target = strings.ToLower(strings.TrimSuffix(v, "."))
+			} else if v, ok := stripMechPrefix(tok, low, "redirect="); ok {
+				target = strings.ToLower(strings.TrimSuffix(v, "."))
+			} else {
+				continue
+			}
+			if target == "" || visited[target] {
+				continue
+			}
+			// Probe the include target. We treat both "no TXT at all"
+			// (NXDOMAIN-like) and "TXT present but no v=spf1" as broken
+			// for include semantics — both produce TempError upstream
+			// and both are sender config errors.
+			childTxts, lookupErr := e.resolver.LookupTXT(ctx, target)
+			if lookupErr != nil {
+				// Distinguish NXDOMAIN from other errors when possible.
+				cause := "lookup failed"
+				if isNXDomainErr(lookupErr) {
+					cause = "NXDOMAIN"
+				}
+				*broken = append(*broken, brokenInclude{target: target, cause: cause})
+				continue
+			}
+			hasSPF := false
+			for _, ct := range childTxts {
+				if isSPFRecord(ct) {
+					hasSPF = true
+					break
+				}
+			}
+			if !hasSPF {
+				*broken = append(*broken, brokenInclude{target: target, cause: "no v=spf1 record"})
+				continue
+			}
+			// Healthy include — recurse to surface deeper breaks too.
+			e.walkBrokenIncludes(ctx, target, visited, broken, depth-1)
 		}
 	}
-	return ""
 }
 
-// checkIPInSPFRecordRecursive checks if an IP is in an SPF record, following includes.
-func (e *Evaluator) checkIPInSPFRecordRecursive(ctx context.Context, ip net.IP, domain string, visited map[string]bool, depth int) bool {
-	// Prevent infinite loops and excessive depth
+// isNXDomainErr returns true if the resolver error indicates the queried
+// name does not exist. Go's net package surfaces this via DNSError.IsNotFound
+// (Go 1.13+) or, on older platforms, by the error text. We check both.
+func isNXDomainErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		if dnsErr.IsNotFound {
+			return true
+		}
+	}
+	// Fallback for resolver paths that don't fill IsNotFound (e.g. some
+	// custom resolvers). The "server misbehaving" string is SERVFAIL, not
+	// NXDOMAIN, and is deliberately NOT matched here.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such host") || strings.Contains(msg, "nxdomain")
+}
+
+// resolverDiag is a human-actionable classification of a DNS resolver error
+// encountered during SPF evaluation. It turns an opaque error string (e.g.
+// "server misbehaving") into an operator-facing cause and a concrete next step.
+type resolverDiag struct {
+	server string // resolver/server that reported the failure, if the error carried it
+	kind   string // short category: SERVFAIL, timeout, refused, unreachable, NXDOMAIN, other
+	cause  string // plain-language likely cause
+	action string // concrete next step for the operator
+}
+
+// classifyResolverError inspects a DNS lookup error (as surfaced by the SPF
+// library, which passes through the underlying *net.DNSError) and produces an
+// actionable diagnosis for the operator log. It is deliberately conservative:
+// when it cannot recognise the error it still returns a useful generic
+// classification rather than nothing.
+//
+// The two field-observed causes it calls out explicitly:
+//   - SERVFAIL ("server misbehaving"): a local resolver that cannot handle a
+//     large or DNSSEC-signed response (e.g. stanford.edu via a dnsmasq that
+//     SERVFAILs large signed RRsets), a DNSSEC validation failure, or an
+//     authoritative server that refuses this host's IP.
+//   - unreachable: the domain's authoritative servers drop traffic from this
+//     host (some operators firewall cloud-hosted IP ranges), so full recursion
+//     fails while public resolvers succeed.
+func classifyResolverError(err error) resolverDiag {
+	d := resolverDiag{
+		kind:   "other",
+		cause:  "DNS lookup failed for a reason the resolver did not detail",
+		action: "compare 'dig TXT <domain>' via the local resolver against 'dig @1.1.1.1 TXT <domain>' to localise the failure",
+	}
+	if err == nil {
+		return d
+	}
+	msg := strings.ToLower(err.Error())
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		d.server = dnsErr.Server
+		switch {
+		case dnsErr.IsNotFound:
+			d.kind = "NXDOMAIN"
+			d.cause = "the name does not exist (authoritative NXDOMAIN)"
+			d.action = "usually a sender-side DNS issue; confirm the domain publishes the expected records"
+			return d
+		case dnsErr.IsTimeout:
+			d.kind = "timeout"
+			d.cause = "the resolver did not answer in time — it may be overloaded, or the authoritative servers are slow/unreachable from this host"
+			d.action = "check local resolver health/load, and verify the domain's authoritative NS respond from this host"
+			return d
+		}
+	}
+
+	switch {
+	case strings.Contains(msg, "server misbehaving"):
+		d.kind = "SERVFAIL"
+		d.cause = "resolver returned SERVFAIL — commonly a local resolver that cannot handle a large or DNSSEC-signed response, a DNSSEC validation failure, or an authoritative server that does not answer this host's IP"
+		d.action = "compare local 'dig TXT <domain>' vs 'dig @1.1.1.1'; if only the local resolver fails on a large/signed record, fix or replace it; if the authoritative servers are unreachable from this host, forward that zone to a public resolver"
+	case strings.Contains(msg, "connection refused"):
+		d.kind = "refused"
+		d.cause = "resolver refused the connection — it may be down or not listening on the configured address"
+		d.action = "verify the local DNS service is running and reachable on the address in /etc/resolv.conf"
+	case strings.Contains(msg, "no route to host"),
+		strings.Contains(msg, "network is unreachable"),
+		strings.Contains(msg, "no servers could be reached"),
+		strings.Contains(msg, "i/o timeout"):
+		d.kind = "unreachable"
+		d.cause = "resolver or the domain's authoritative servers could not be reached from this host (network/firewall); some DNS operators firewall cloud-hosted IP ranges"
+		d.action = "check egress on udp/tcp 53; if the domain's authoritative NS block this host, forward that zone to a public resolver"
+	case strings.Contains(msg, "no such host"), strings.Contains(msg, "nxdomain"):
+		d.kind = "NXDOMAIN"
+		d.cause = "the name does not exist (authoritative NXDOMAIN)"
+		d.action = "usually a sender-side DNS issue; confirm the domain publishes the expected records"
+	}
+	return d
+}
+
+// getSPFRecords retrieves all v=spf1 TXT records for a domain.
+// A domain SHOULD have at most one (RFC 7208 §4.5); multiple is a misconfiguration
+// that yields PermError, but in tolerant mode we expose all of them.
+func (e *Evaluator) getSPFRecords(ctx context.Context, domain string) []string {
+	txts, err := e.resolver.LookupTXT(ctx, domain)
+	if err != nil {
+		return nil
+	}
+
+	var records []string
+	for _, txt := range txts {
+		if isSPFRecord(txt) {
+			records = append(records, txt)
+		}
+	}
+	return records
+}
+
+// checkIPInSPFRecordRecursive checks if an IP is in any v=spf1 record at the domain
+// or its includes. When a domain has multiple v=spf1 records, all are checked and
+// any match passes (union semantics).
+func (e *Evaluator) checkIPInSPFRecordRecursive(ctx context.Context, walk *spfWalk, domain string, depth int) bool {
 	if depth <= 0 {
 		return false
 	}
 	domain = strings.ToLower(domain)
-	if visited[domain] {
+	if walk.visited[domain] {
 		return false
 	}
-	visited[domain] = true
+	walk.visited[domain] = true
 
-	// Look up TXT records for the domain
 	txts, err := e.resolver.LookupTXT(ctx, domain)
 	if err != nil {
 		return false
 	}
 
-	// Find the SPF record
-	var spfRecord string
 	for _, txt := range txts {
-		if strings.HasPrefix(strings.ToLower(txt), "v=spf1 ") {
-			spfRecord = txt
-			break
+		if !isSPFRecord(txt) {
+			continue
+		}
+		if e.ipMatchesSPFRecord(ctx, walk, domain, txt, depth) {
+			return true
 		}
 	}
+	return false
+}
 
-	if spfRecord == "" {
-		return false
-	}
-
-	// Parse the SPF record
-	parts := strings.Fields(spfRecord)
+// ipMatchesSPFRecord parses a single SPF record string and reports whether the
+// IP matches via ip4:, ip6:, include:, exists:, or redirect= terms. Recurses
+// into include: and redirect= targets.
+// `currentDomain` is the domain whose record we are currently parsing (used as %{d}).
+// Note: qualifiers other than '+' are not interpreted — a '-ip4:' still counts
+// as a match. This is consistent with the rest of the tolerant-mode behavior.
+func (e *Evaluator) ipMatchesSPFRecord(ctx context.Context, walk *spfWalk, currentDomain, spfRecord string, depth int) bool {
+	parts := splitSPFTokens(spfRecord)
 	for _, part := range parts {
 		partLower := strings.ToLower(part)
 
-		// Handle ip4: mechanism (with optional + prefix)
-		if strings.HasPrefix(partLower, "ip4:") || strings.HasPrefix(partLower, "+ip4:") {
-			ipSpec := strings.TrimPrefix(partLower, "+")
-			ipSpec = strings.TrimPrefix(ipSpec, "ip4:")
-			if matchesIPSpec(ip, ipSpec) {
+		if val, ok := stripMechPrefix(part, partLower, "ip4:"); ok {
+			if matchesIPSpec(walk.clientIP, strings.ToLower(val)) {
 				return true
 			}
+			continue
 		}
 
-		// Handle ip6: mechanism (with optional + prefix)
-		if strings.HasPrefix(partLower, "ip6:") || strings.HasPrefix(partLower, "+ip6:") {
-			ipSpec := strings.TrimPrefix(partLower, "+")
-			ipSpec = strings.TrimPrefix(ipSpec, "ip6:")
-			if matchesIPSpec(ip, ipSpec) {
+		if val, ok := stripMechPrefix(part, partLower, "ip6:"); ok {
+			if matchesIPSpec(walk.clientIP, strings.ToLower(val)) {
 				return true
 			}
+			continue
 		}
 
-		// Handle include: mechanism (with optional + prefix)
-		if strings.HasPrefix(partLower, "include:") || strings.HasPrefix(partLower, "+include:") {
-			includeDomain := strings.TrimPrefix(partLower, "+")
-			includeDomain = strings.TrimPrefix(includeDomain, "include:")
-			if e.checkIPInSPFRecordRecursive(ctx, ip, includeDomain, visited, depth-1) {
+		if val, ok := stripMechPrefix(part, partLower, "include:"); ok {
+			// include: targets are domain names — lowercase is fine.
+			if e.checkIPInSPFRecordRecursive(ctx, walk, strings.ToLower(val), depth-1) {
 				return true
 			}
+			continue
+		}
+
+		if val, ok := stripMechPrefix(part, partLower, "redirect="); ok {
+			// redirect= points evaluation at another domain's record
+			// (RFC 7208 §6.1). Records that use a bare apex redirect —
+			// e.g. cisco.com is "v=spf1 redirect=spfa._spf.cisco.com" —
+			// keep all their ip4:/include: terms in the target, so without
+			// following the redirect the walk never reaches any authorized
+			// IP and the PermError bypass silently no-ops for the whole
+			// (large) class of redirect-based senders. Treat it like an
+			// include for the "is this IP authorized anywhere in the chain"
+			// question: recurse, and match if the target authorizes the IP.
+			target := strings.TrimSuffix(strings.ToLower(val), ".")
+			if target != "" && e.checkIPInSPFRecordRecursive(ctx, walk, target, depth-1) {
+				return true
+			}
+			continue
+		}
+
+		if val, ok := stripMechPrefix(part, partLower, "exists:"); ok {
+			expanded, exOk := expandSPFMacros(val, walk, currentDomain)
+			if !exOk {
+				// Unsupported macro syntax — skip silently in tolerant mode.
+				continue
+			}
+			ips, err := e.resolver.LookupIP(ctx, "ip4", expanded)
+			if err == nil && len(ips) > 0 {
+				return true
+			}
+			continue
 		}
 	}
-
 	return false
+}
+
+// stripMechPrefix returns the value portion of a mechanism token if the token
+// starts with `mech:` (optionally preceded by a `+` qualifier), case-insensitive
+// on the prefix. The original-case suffix is preserved for callers that need
+// case-sensitive value handling (e.g. macro expansion).
+func stripMechPrefix(part, partLower, mech string) (string, bool) {
+	if strings.HasPrefix(partLower, mech) {
+		return part[len(mech):], true
+	}
+	if strings.HasPrefix(partLower, "+"+mech) {
+		return part[len(mech)+1:], true
+	}
+	return "", false
+}
+
+// expandSPFMacros performs minimal SPF macro expansion (RFC 7208 §7.2) sufficient
+// for the most common exists: patterns. Supports:
+//   - %% (literal %), %_ (space), %- (literal "%20")
+//   - %{i} %{s} %{o} %{d} %{l} %{h}
+//
+// Macros with transformers (digits or 'r'), or unknown letters, cause the whole
+// expansion to fail with ok=false; callers should skip the mechanism.
+func expandSPFMacros(spec string, walk *spfWalk, currentDomain string) (string, bool) {
+	if !strings.Contains(spec, "%") {
+		return spec, true
+	}
+
+	var b strings.Builder
+	b.Grow(len(spec) * 2)
+	i := 0
+	for i < len(spec) {
+		c := spec[i]
+		if c != '%' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		if i+1 >= len(spec) {
+			return "", false
+		}
+		switch spec[i+1] {
+		case '%':
+			b.WriteByte('%')
+			i += 2
+		case '_':
+			b.WriteByte(' ')
+			i += 2
+		case '-':
+			b.WriteString("%20")
+			i += 2
+		case '{':
+			end := strings.IndexByte(spec[i+2:], '}')
+			if end < 0 {
+				return "", false
+			}
+			macro := spec[i+2 : i+2+end]
+			// Only single-letter macros, no transformers (digits/'r').
+			if len(macro) != 1 {
+				return "", false
+			}
+			val, ok := lookupMacroLetter(macro[0], walk, currentDomain)
+			if !ok {
+				return "", false
+			}
+			b.WriteString(val)
+			i += 3 + end // %, {, ..., }
+		default:
+			return "", false
+		}
+	}
+	return b.String(), true
+}
+
+func lookupMacroLetter(letter byte, walk *spfWalk, currentDomain string) (string, bool) {
+	switch letter {
+	case 'i', 'I':
+		return macroIP(walk.clientIP), true
+	case 's', 'S':
+		return walk.senderEmail, walk.senderEmail != ""
+	case 'o', 'O':
+		return walk.senderDomain, walk.senderDomain != ""
+	case 'd', 'D':
+		return currentDomain, currentDomain != ""
+	case 'l', 'L':
+		if at := strings.IndexByte(walk.senderEmail, '@'); at > 0 {
+			return walk.senderEmail[:at], true
+		}
+		return "", false
+	case 'h', 'H':
+		return walk.heloName, walk.heloName != ""
+	default:
+		return "", false
+	}
+}
+
+// macroIP returns the %{i} expansion: dotted-quad for IPv4, dot-separated nibble
+// form (most-significant-first) for IPv6, per RFC 7208 §7.4.
+func macroIP(ip net.IP) string {
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4.String()
+	}
+	if ip6 := ip.To16(); ip6 != nil {
+		nibbles := make([]string, 0, 32)
+		for _, b := range ip6 {
+			nibbles = append(nibbles, fmt.Sprintf("%x", b>>4), fmt.Sprintf("%x", b&0x0f))
+		}
+		return strings.Join(nibbles, ".")
+	}
+	return ""
+}
+
+// splitSPFTokens splits an SPF record into mechanism tokens, recovering from
+// a common admin typo: a missing space before the terminating "all" mechanism.
+// E.g. "v=spf1 +ip4:1.2.3.4~all" -> ["v=spf1", "+ip4:1.2.3.4", "~all"].
+//
+// The "all" mechanism is always terminal (RFC 7208 §5.1), so any [+-~?]all
+// suffix preceded by a non-space character is unambiguously a missing-space
+// typo. Only the trailing all-token is split off; other concatenation typos
+// (e.g. "+mx+a") are left alone because they are genuinely ambiguous.
+func splitSPFTokens(record string) []string {
+	allSuffixes := []string{"~all", "-all", "?all", "+all"}
+	fields := strings.Fields(record)
+	out := make([]string, 0, len(fields)+1)
+	for _, f := range fields {
+		split := false
+		// Case-insensitive suffix check; the bare "all" mechanism is also valid.
+		lower := strings.ToLower(f)
+		for _, s := range allSuffixes {
+			if len(lower) > len(s) && strings.HasSuffix(lower, s) {
+				out = append(out, f[:len(f)-len(s)], f[len(f)-len(s):])
+				split = true
+				break
+			}
+		}
+		// Also handle bare "all" mashed onto a previous token (no qualifier).
+		if !split && len(lower) > 3 && strings.HasSuffix(lower, "all") {
+			// Only split if the character before "all" looks like the end of a
+			// value (digit, letter, dot, colon) — avoids splitting tokens that
+			// legitimately end in "all" like "include:foo.callall.example".
+			// In practice the common case is an IP or domain followed by "all".
+			prev := lower[len(lower)-4]
+			if prev >= '0' && prev <= '9' || prev == '.' {
+				out = append(out, f[:len(f)-3], f[len(f)-3:])
+				split = true
+			}
+		}
+		if !split {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // matchesIPSpec checks if an IP matches an SPF IP specification (IP or CIDR).

@@ -1,11 +1,12 @@
 # Claude Code local settings
 .claude/
 
-# Build artifacts
-postfix-spf-policy
-postfix-spf-policy-installer.run
-spf-check
-domain-check
+# Build artifacts (anchored to repo root so they don't match the
+# cmd/postfix-spf-policy/ source directory of the same name)
+/postfix-spf-policy
+/postfix-spf-policy-installer.run
+/spf-check
+/domain-check
 
 # Editor files
 *~
@@ -26,3 +27,25 @@ Thumbs.db
 *.log
 *.tmp
 testdata/
+
+# Perl-era files (retired)
+*.pl
+*.pl.backup
+*.pm
+SPF/
+tests/
+*.conf.template
+*-cache.conf
+spf-policy-logs
+spf-policy-logs/
+support-team.txt*
+local_domains.conf*
+debug-*.sh
+setup-*.sh
+simple-policy-debug.*
+DEPLOYMENT.md
+SENDER_AUTH_LOGGING.md
+/postfix-spf-policy.conf
+postfix-spf-policy-daemon.sh
+production-cache.conf
+test-cache.conf

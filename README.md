@@ -20,7 +20,7 @@ A high-performance SPF (Sender Policy Framework) policy server for Postfix with 
 
 ```bash
 # Clone the repository
-git clone https://github.com/youruser/postfix-spf-policy.git
+git clone https://github.com/sirqix/postfix-spf-policy.git
 cd postfix-spf-policy
 
 # Build

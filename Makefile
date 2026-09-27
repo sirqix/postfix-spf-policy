@@ -30,6 +30,10 @@ clean:
 test:
 	go test -mod=vendor -v ./...
 
+# Run integration tests (requires network)
+test-integration:
+	go test -mod=vendor -v -tags=integration ./...
+
 # Check if upstream dependencies have newer versions available
 check-updates:
 	@echo "Checking for upstream dependency updates..."
