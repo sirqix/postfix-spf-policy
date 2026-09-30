@@ -32,8 +32,8 @@ func TestFindBrokenIncludes_Live(t *testing.T) {
 	for _, bi := range broken {
 		if bi.target == "spf-us.ppe-hosted.com" {
 			found = true
-			if bi.cause != "NXDOMAIN" {
-				t.Errorf("expected NXDOMAIN cause for spf-us.ppe-hosted.com, got %q", bi.cause)
+			if bi.cause != voidTargetCause {
+				t.Errorf("expected %q cause for spf-us.ppe-hosted.com, got %q", voidTargetCause, bi.cause)
 			}
 		}
 	}

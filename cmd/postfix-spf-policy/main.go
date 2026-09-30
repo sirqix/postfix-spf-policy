@@ -413,6 +413,7 @@ func printStats(logger *slog.Logger, handler *policy.Handler, eval *evaluator.Ev
 		"permerrors", eStats.PermErrors,
 		"temperrors", eStats.TempErrors,
 		"tolerant_overrides", eStats.TolerantOverrides,
+		"term_errors_ignored", eStats.TermErrorsIgnored,
 	)
 
 	logger.Info("cache",
@@ -475,13 +476,14 @@ func runSPFCheck() {
 	sender := fs.String("sender", "", "Sender email address (required)")
 	helo := fs.String("helo", "", "HELO/EHLO hostname (optional, defaults to sender domain)")
 	configFile := fs.String("config", defaultConfig, "Configuration file")
+	verbose := fs.Bool("verbose", false, "Print the evaluator's log lines (overrides, ignored terms, causes) to stderr")
 	showVersion := fs.Bool("version", false, "Show version")
 	showHelp := fs.Bool("help", false, "Show help")
 
 	fs.Usage = func() {
 		fmt.Println(`spf-check - SPF diagnostic tool
 
-Usage: spf-check --ip IP --sender EMAIL [--helo HOSTNAME] [--config FILE]
+Usage: spf-check --ip IP --sender EMAIL [--helo HOSTNAME] [--config FILE] [--verbose]
 
 This tool checks SPF for a given IP/sender combination and shows what
 action postfix-spf-policy would take, using the exact same code path
@@ -492,11 +494,14 @@ Options:
   --sender EMAIL    Sender email address (required)
   --helo HOSTNAME   HELO/EHLO hostname (optional)
   --config FILE     Configuration file (default: /etc/postfix/postfix-spf-policy.conf)
+  --verbose         Print the evaluator's log lines to stderr (why a record
+                    is a PermError, which SPF terms were ignored, overrides)
   --version         Show version
   --help            Show this help
 
 Examples:
   spf-check --ip 192.0.2.1 --sender user@example.com
+  spf-check --ip 192.0.2.1 --sender user@example.com --verbose
   spf-check --ip 192.0.2.1 --sender user@example.com --helo mail.example.com
 
 Exit codes:
@@ -546,8 +551,11 @@ Exit codes:
 		heloName = senderDomain
 	}
 
-	// Create a silent logger (discard output)
+	// Silent by default; --verbose shows the same lines the daemon would log.
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if *verbose {
+		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	}
 
 	// Load configuration (silently use defaults if not found)
 	cfg, err := config.Load(*configFile)

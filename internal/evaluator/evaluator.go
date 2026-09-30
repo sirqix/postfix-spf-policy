@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"blitiri.com.ar/go/spf"
+	"golang.org/x/net/publicsuffix"
 )
 
 // spfRaisedLookupLimit is the DNS-lookup cap used when re-evaluating a sender
@@ -30,6 +31,17 @@ type Result struct {
 	SPFResult spf.Result
 	Tolerant  bool     // Was tolerant override applied?
 	Evidence  []string // Evidence for tolerant decision
+	// IgnoredTerms lists the unusable SPF terms that were excluded from the
+	// sender's record chain to reach SPFResult (tolerant mode only).
+	IgnoredTerms []string
+}
+
+// dnsResolver is the DNS surface the evaluator needs: everything the SPF
+// library uses plus LookupIP for the tolerant heuristics. *net.Resolver
+// satisfies it; tests substitute a fake.
+type dnsResolver interface {
+	spf.DNSResolver
+	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
 }
 
 // Stats holds evaluation statistics.
@@ -43,12 +55,13 @@ type Stats struct {
 	PermErrors        int64
 	TempErrors        int64
 	TolerantOverrides int64
+	TermErrorsIgnored int64 // Evaluations decided after excluding unusable SPF terms
 }
 
 // Evaluator performs SPF checks with tolerant heuristics.
 type Evaluator struct {
 	dnsTimeout   time.Duration
-	resolver     *net.Resolver
+	resolver     dnsResolver
 	logger       *slog.Logger
 	tolerantMode atomic.Bool // Whether tolerant heuristics are enabled
 
@@ -62,6 +75,7 @@ type Evaluator struct {
 	permErrors        atomic.Int64
 	tempErrors        atomic.Int64
 	tolerantOverrides atomic.Int64
+	termErrorsIgnored atomic.Int64
 }
 
 // New creates a new Evaluator with tolerant mode enabled by default.
@@ -118,7 +132,8 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 		identity = heloName
 	}
 
-	result, debugInfo := spf.CheckHostWithSender(ip, heloName, identity, spf.WithContext(ctx))
+	result, debugInfo := spf.CheckHostWithSender(ip, heloName, identity,
+		spf.WithContext(ctx), spf.WithResolver(e.resolver))
 	// Note: The SPF library returns an error for debugging purposes even on successful checks.
 	// The error indicates which mechanism matched (e.g., "matched ip", "matched mx").
 	// We should only treat it as a real error if the result is TempError or PermError.
@@ -139,8 +154,13 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 	// surfaces as PermError and is handled below unchanged.
 	if result == spf.PermError && errors.Is(debugInfo, spf.ErrLookupLimitReached) {
 		r2, d2 := spf.CheckHostWithSender(ip, heloName, identity,
-			spf.WithContext(ctx), spf.OverrideLookupLimit(spfRaisedLookupLimit))
-		if r2 != spf.PermError && r2 != spf.TempError {
+			spf.WithContext(ctx), spf.WithResolver(e.resolver), spf.OverrideLookupLimit(spfRaisedLookupLimit))
+		if r2 == spf.PermError {
+			// Still a PermError with headroom: keep the raised-limit error
+			// for diagnosis. It is either a genuine overrun (limit reached
+			// again) or a different defect that sat behind the 10th lookup.
+			debugInfo = d2
+		} else if r2 != spf.TempError {
 			e.logger.Info("SPF lookup-limit permerror re-evaluated with raised limit",
 				"domain", senderDomain,
 				"ip", clientIP,
@@ -152,6 +172,45 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 				"note", "upstream lib over-counts mx/a host lookups; real MTAs deliver this sender",
 			)
 			result, debugInfo = r2, d2
+		}
+	}
+
+	// A PermError that survives the raised limit is usually a defect in the
+	// published record itself: a misspelled mechanism ("ip:" for "ip4:"), a
+	// stray token, an unknown modifier (which RFC 7208 §6 says to ignore but
+	// the library rejects). In tolerant mode such terms are excluded from
+	// consideration and the rest of the record decides, exactly as if the
+	// sender had not published them. Re-run once through a resolver that
+	// strips them from every record in the chain. The raised lookup limit is
+	// used because the strict pass stopped at the bad term and never counted
+	// what follows it.
+	var ignored []termIssue
+	if result == spf.PermError && e.tolerantMode.Load() {
+		san := &sanitizingResolver{DNSResolver: e.resolver}
+		r3, d3 := spf.CheckHostWithSender(ip, heloName, identity,
+			spf.WithContext(ctx), spf.WithResolver(san), spf.OverrideLookupLimit(spfRaisedLookupLimit))
+		switch {
+		case len(san.issues) == 0 || r3 == spf.TempError:
+			// Nothing to exclude, or DNS failed past the bad term: keep the
+			// strict PermError and let the handling below decide.
+		case r3 == spf.PermError:
+			// Terms were excluded but another defect remains (too many
+			// lookups, void include, ...). Report that one as the cause.
+			ignored, debugInfo = san.issues, d3
+		default:
+			e.termErrorsIgnored.Add(1)
+			ignored = san.issues
+			e.logger.Info("SPF record errors ignored",
+				"ip", clientIP,
+				"sender", sender,
+				"domain", senderDomain,
+				"helo", heloName,
+				"original", "permerror",
+				"original_cause", permErrorCause(debugInfo),
+				"resolved", spfResultString(r3),
+				"ignored_terms", formatIssues(ignored, 0),
+			)
+			result, debugInfo = r3, d3
 		}
 	}
 
@@ -236,15 +295,43 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 		Reason:    reason,
 		SPFResult: result,
 	}
+	ignoredTerms := formatIssues(ignored, 3)
+	if len(ignored) > 0 {
+		for _, i := range ignored {
+			res.IgnoredTerms = append(res.IgnoredTerms, i.String())
+		}
+		if result != spf.PermError && res.Action != "DUNNO" {
+			// Tell the sender's postmaster which terms were discounted, so a
+			// fail caused by their own typo is diagnosable from the bounce.
+			res.Reason += " Ignored invalid SPF terms: " + ignoredTerms
+		}
+	}
 
 	// Apply tolerant heuristics for softfail/fail/permerror (if enabled)
+	var permCause string // what is wrong with the record, for a PermError that is not IP-matched
 	if e.tolerantMode.Load() && (result == spf.Fail || result == spf.SoftFail || result == spf.PermError) {
-		// For PermError, first check if IP is directly listed in SPF record.
-		// Handles two cases the upstream library rejects with PermError:
-		//   1. SPF record exceeded the 10 DNS lookup limit (RFC 7208 §4.6.4).
-		//   2. Domain has multiple v=spf1 TXT records (RFC 7208 §4.5) — we
-		//      treat them as a union: any record authorizing the IP passes.
+		// A PermError reaching this point is one that excluding bad terms
+		// could not resolve: too many DNS lookups even at the raised limit,
+		// more than 10 MX records behind an mx mechanism, a void include or
+		// redirect target, or multiple v=spf1 records (RFC 7208 §4.5 — we
+		// treat those as a union: any record authorizing the IP passes).
+		// If the IP is nonetheless listed in the chain, let the mail through.
 		if result == spf.PermError {
+			cause := permErrorCause(debugInfo)
+			if isVoidTargetErr(debugInfo) {
+				if broken := e.findBrokenIncludes(ctx, senderDomain); len(broken) > 0 {
+					parts := make([]string, 0, len(broken))
+					for _, bi := range broken {
+						parts = append(parts, fmt.Sprintf("%s (%s)", bi.target, bi.cause))
+					}
+					cause = "SPF chain references a target with no SPF record: " + strings.Join(parts, ", ")
+				}
+			}
+			spfError := "none"
+			if debugInfo != nil {
+				spfError = debugInfo.Error()
+			}
+
 			ipInSPF, spfRecords := e.checkIPInSPFRecord(ctx, clientIP, sender, heloName, senderDomain)
 			if ipInSPF {
 				e.tolerantOverrides.Add(1)
@@ -253,7 +340,7 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 				res.Action = "DUNNO"
 
 				evidence := fmt.Sprintf("IP %s found in SPF record chain (PermError bypassed)", clientIP)
-				problem := "SPF record exceeded DNS lookup limit but IP is authorized in SPF chain"
+				problem := cause + "; IP is authorized in SPF chain"
 				if len(spfRecords) > 1 {
 					evidence = fmt.Sprintf("IP %s found in SPF record chain (PermError bypassed; %d v=spf1 records present, treated as union)", clientIP, len(spfRecords))
 					problem = fmt.Sprintf("Multiple v=spf1 records (%d) cause PermError; IP is authorized in at least one record", len(spfRecords))
@@ -269,6 +356,8 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 					"spf_result", "permerror",
 					"original_action", originalAction,
 					"problem", problem,
+					"spf_error", spfError,
+					"ignored_terms", ignoredTerms,
 					"spf_record", strings.Join(spfRecords, " || "),
 					"spf_record_count", len(spfRecords),
 					"evidence", strings.Join(res.Evidence, "; "),
@@ -279,7 +368,11 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 			// operator sees the actual cause (e.g. multi-record) instead of a
 			// generic "invalid SPF record syntax" string. Heuristics below may
 			// still override this reason with a tolerant pass.
-			res.Reason = permErrorReason(senderDomain, spfRecords)
+			res.Reason = permErrorReason(senderDomain, spfRecords, cause)
+			if ignoredTerms != "" {
+				res.Reason += " Ignored invalid SPF terms: " + ignoredTerms
+			}
+			permCause = cause
 		}
 
 		// Apply standard tolerant heuristics
@@ -298,7 +391,7 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 			case spf.SoftFail:
 				problem = "SPF soft fail (~all) but sender shows signs of legitimacy"
 			case spf.PermError:
-				problem = "SPF record has syntax error or too many DNS lookups"
+				problem = permCause
 			}
 
 			// Log tolerant override at INFO level
@@ -310,6 +403,7 @@ func (e *Evaluator) Evaluate(clientIP, sender, heloName string) (*Result, error)
 				"spf_result", spfResultString(result),
 				"original_action", originalAction,
 				"problem", problem,
+				"ignored_terms", ignoredTerms,
 				"evidence", strings.Join(res.Evidence, "; "),
 			)
 		}
@@ -353,28 +447,46 @@ func (e *Evaluator) resultToAction(result spf.Result, sender, domain string) (st
 	}
 }
 
+// Heuristic weights. A tolerant override needs overrideThresholdLenient
+// points for softfail/permerror and overrideThresholdStrict for fail. Each
+// heuristic contributes at most once, however many PTR names or MX hosts
+// match.
+const (
+	scoreRDNSAligned         = 30 // client's confirmed rDNS is (under) the sender domain
+	scoreRDNSParent          = 20 // sender domain is under the client's registrable domain
+	scoreHELOAligned         = 25
+	scoreHELORelated         = 15
+	scoreMXAligned           = 40 // match and go for softfail/permerror; fail (-all) needs more
+	scoreMXSubnet            = 40 // client shares an MX's /24 (IPv4) or /64 (IPv6)
+	overrideThresholdLenient = 40
+	overrideThresholdStrict  = 60
+)
+
 // shouldOverride applies tolerant heuristics to determine if we should
-// override an SPF fail/softfail.
+// override an SPF fail/softfail/permerror.
 func (e *Evaluator) shouldOverride(ctx context.Context, clientIP, senderDomain, heloName string, res *Result) bool {
 	var evidence []string
 	score := 0
+	clientNetIP := net.ParseIP(clientIP)
+
+	// Every rDNS-based heuristic uses only forward-confirmed names: whoever
+	// controls an IP's reverse zone can publish any PTR (e.g. "x.google.com"),
+	// so an unconfirmed name proves nothing.
+	names := e.confirmedPTRNames(ctx, clientNetIP)
 
 	// Heuristic 1: rDNS alignment
 	// If the client's reverse DNS matches or is a subdomain of the sender domain
-	if names, err := e.resolver.LookupAddr(ctx, clientIP); err == nil && len(names) > 0 {
-		for _, name := range names {
-			name = strings.TrimSuffix(strings.ToLower(name), ".")
-			if strings.HasSuffix(name, "."+senderDomain) || name == senderDomain {
-				score += 30
-				evidence = append(evidence, fmt.Sprintf("rDNS aligned: %s", name))
-				break
-			}
-			// Check if sender domain is subdomain of rDNS
-			if strings.HasSuffix(senderDomain, "."+getDomainRoot(name)) {
-				score += 20
-				evidence = append(evidence, fmt.Sprintf("rDNS parent: %s", name))
-				break
-			}
+	for _, name := range names {
+		if strings.HasSuffix(name, "."+senderDomain) || name == senderDomain {
+			score += scoreRDNSAligned
+			evidence = append(evidence, fmt.Sprintf("rDNS aligned: %s", name))
+			break
+		}
+		// Check if sender domain is subdomain of rDNS
+		if strings.HasSuffix(senderDomain, "."+getDomainRoot(name)) {
+			score += scoreRDNSParent
+			evidence = append(evidence, fmt.Sprintf("rDNS parent: %s", name))
+			break
 		}
 	}
 
@@ -383,50 +495,62 @@ func (e *Evaluator) shouldOverride(ctx context.Context, clientIP, senderDomain, 
 	if heloName != "" {
 		heloLower := strings.ToLower(heloName)
 		if heloLower == senderDomain || strings.HasSuffix(heloLower, "."+senderDomain) {
-			score += 25
+			score += scoreHELOAligned
 			evidence = append(evidence, fmt.Sprintf("HELO aligned: %s", heloName))
 		} else if strings.HasSuffix(senderDomain, "."+getDomainRoot(heloLower)) {
-			score += 15
+			score += scoreHELORelated
 			evidence = append(evidence, fmt.Sprintf("HELO related: %s", heloName))
 		}
 	}
 
-	// Heuristic 3: MX alignment (hostname match)
-	// Check if sender domain's MX records point to something related to client
+	var mxHosts []string
 	if mxs, err := e.resolver.LookupMX(ctx, senderDomain); err == nil {
 		for _, mx := range mxs {
-			mxHost := strings.TrimSuffix(strings.ToLower(mx.Host), ".")
-			// Check if client IP resolves to an MX host
-			if names, err := e.resolver.LookupAddr(ctx, clientIP); err == nil {
-				for _, name := range names {
-					name = strings.TrimSuffix(strings.ToLower(name), ".")
-					if name == mxHost || strings.HasSuffix(name, "."+getDomainRoot(mxHost)) {
-						score += 25
-						evidence = append(evidence, fmt.Sprintf("MX hostname aligned: %s", mxHost))
-						break
-					}
-				}
+			if h := strings.TrimSuffix(strings.ToLower(mx.Host), "."); h != "" {
+				mxHosts = append(mxHosts, h)
+			}
+		}
+	}
+
+	// Heuristic 3: MX alignment (match and go)
+	// The client's confirmed rDNS is in the same registrable domain as one of
+	// the sender domain's MX hosts, i.e. the mail comes from the organisation
+	// (or provider, e.g. Google/Microsoft) that receives the domain's mail.
+	// This alone overrides softfail/permerror, independent of how many MX
+	// records the domain has. It is a provider-level match (any Google,
+	// Microsoft or Proofpoint customer shares it), so it deliberately does
+	// not override a hard fail on its own: -all is the sender's explicit
+	// decision, and tolerance is only meant to absorb typos and human error.
+mxAlign:
+	for _, mxHost := range mxHosts {
+		mxRoot := getDomainRoot(mxHost)
+		for _, name := range names {
+			if name == mxHost || getDomainRoot(name) == mxRoot {
+				score += scoreMXAligned
+				evidence = append(evidence, fmt.Sprintf("MX hostname aligned: %s ~ %s", name, mxHost))
+				break mxAlign
 			}
 		}
 	}
 
 	// Heuristic 4: MX subnet proximity
-	// Check if client IP is in the same /24 subnet as the domain's MX servers
-	// This catches misconfigured mail servers that are in the same network as legitimate MX
-	clientNetIP := net.ParseIP(clientIP)
-	if clientNetIP != nil {
-		if mxs, err := e.resolver.LookupMX(ctx, senderDomain); err == nil {
-			for _, mx := range mxs {
-				mxHost := strings.TrimSuffix(mx.Host, ".")
-				if mxIPs, err := e.resolver.LookupIP(ctx, "ip4", mxHost); err == nil {
-					for _, mxIP := range mxIPs {
-						if sameSubnet(clientNetIP, mxIP, 24) {
-							score += 40
-							evidence = append(evidence, fmt.Sprintf("same /24 subnet as MX %s (%s)", mxHost, mxIP))
-							break
-						}
-					}
-				}
+	// Client in the same /24 (IPv4) or /64 (IPv6) as one of the domain's MX
+	// servers. Catches misconfigured mail servers on the same network as the
+	// legitimate MX.
+mxSubnet:
+	for _, mxHost := range mxHosts {
+		if clientNetIP == nil {
+			break
+		}
+		mxIPs, err := e.resolver.LookupIP(ctx, "ip", mxHost)
+		if err != nil {
+			continue
+		}
+		for _, mxIP := range mxIPs {
+			if prefix, ok := sameMXNetwork(clientNetIP, mxIP); ok {
+				score += scoreMXSubnet
+				evidence = append(evidence, fmt.Sprintf("same /%d subnet as MX %s (%s)", prefix, mxHost, mxIP))
+				break mxSubnet
 			}
 		}
 	}
@@ -434,14 +558,58 @@ func (e *Evaluator) shouldOverride(ctx context.Context, clientIP, senderDomain, 
 	res.Evidence = evidence
 
 	// Threshold for override
-	// For softfail/permerror: lower threshold (40) - these indicate config issues, not spoofing
-	// For fail: higher threshold (60) - explicit rejection by SPF policy
-	threshold := 60
+	// For softfail/permerror: lower threshold - these indicate config issues, not spoofing
+	// For fail: higher threshold - explicit rejection by SPF policy
+	threshold := overrideThresholdStrict
 	if res.SPFResult == spf.SoftFail || res.SPFResult == spf.PermError {
-		threshold = 40
+		threshold = overrideThresholdLenient
 	}
 
 	return score >= threshold
+}
+
+// confirmedPTRNames returns the client's PTR names (lowercased, no trailing
+// dot) that resolve forward to the client IP again (FCrDNS).
+func (e *Evaluator) confirmedPTRNames(ctx context.Context, ip net.IP) []string {
+	if ip == nil {
+		return nil
+	}
+	ptrs, err := e.resolver.LookupAddr(ctx, ip.String())
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, ptr := range ptrs {
+		name := strings.TrimSuffix(strings.ToLower(ptr), ".")
+		if name == "" {
+			continue
+		}
+		addrs, err := e.resolver.LookupIP(ctx, "ip", name)
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if a.Equal(ip) {
+				names = append(names, name)
+				break
+			}
+		}
+	}
+	return names
+}
+
+// sameMXNetwork reports whether a and b share a /24 (both IPv4) or a /64
+// (both IPv6), returning the prefix length that matched.
+func sameMXNetwork(a, b net.IP) (int, bool) {
+	if a.To4() != nil || b.To4() != nil {
+		return 24, sameSubnet(a, b, 24)
+	}
+	a16, b16 := a.To16(), b.To16()
+	if a16 == nil || b16 == nil {
+		return 64, false
+	}
+	mask := net.CIDRMask(64, 128)
+	return 64, a16.Mask(mask).Equal(b16.Mask(mask))
 }
 
 // extractDomain extracts the domain from an email address.
@@ -460,11 +628,13 @@ func extractDomain(email string) string {
 	return ""
 }
 
-// getDomainRoot returns the registrable domain (last two parts).
+// getDomainRoot returns the registrable domain (public suffix + 1 label),
+// e.g. "mail.example.co.uk" -> "example.co.uk", not "co.uk". A name that is
+// itself a public suffix (or unparseable) is returned unchanged.
 func getDomainRoot(domain string) string {
-	parts := strings.Split(domain, ".")
-	if len(parts) >= 2 {
-		return strings.Join(parts[len(parts)-2:], ".")
+	domain = strings.TrimSuffix(strings.ToLower(domain), ".")
+	if root, err := publicsuffix.EffectiveTLDPlusOne(domain); err == nil {
+		return root
 	}
 	return domain
 }
@@ -473,14 +643,17 @@ func getDomainRoot(domain string) string {
 // overridden, using the count of v=spf1 records found at the apex to
 // distinguish the most common causes. The upstream library returns a single
 // PermError constant for all causes; we narrow it for operator clarity.
-func permErrorReason(domain string, records []string) string {
+//
+// `cause` is the specific defect derived from the library's error (see
+// permErrorCause); it is used when the record count alone doesn't explain it.
+func permErrorReason(domain string, records []string, cause string) string {
 	switch {
 	case len(records) > 1:
 		return fmt.Sprintf("SPF permanent error for %s: %d v=spf1 records found at apex (RFC 7208 §4.5 requires exactly one — merge them into a single record).", domain, len(records))
 	case len(records) == 0:
 		return fmt.Sprintf("SPF permanent error for %s: no usable v=spf1 record found (referenced include/redirect target may be missing, or DNS may be misconfigured).", domain)
 	default:
-		return fmt.Sprintf("SPF permanent error for %s: invalid mechanism syntax or too many DNS lookups (RFC 7208 §4.6.4 limit is 10 lookups per evaluation).", domain)
+		return fmt.Sprintf("SPF permanent error for %s: %s.", domain, cause)
 	}
 }
 
@@ -525,10 +698,13 @@ func (e *Evaluator) checkIPInSPFRecord(ctx context.Context, clientIP, sender, he
 	return found, records
 }
 
+// voidTargetCause labels an include/redirect target with no TXT record.
+const voidTargetCause = "NXDOMAIN or no TXT record"
+
 // brokenInclude describes an SPF include target that fails to resolve.
 type brokenInclude struct {
 	target string // the include target as written (e.g. "spf-us.ppe-hosted.com")
-	cause  string // short cause: "NXDOMAIN" or "no v=spf1 record"
+	cause  string // short cause: voidTargetCause, "no v=spf1 record" or "lookup failed"
 }
 
 // findBrokenIncludes walks the SPF chain of `domain` and returns every
@@ -596,10 +772,12 @@ func (e *Evaluator) walkBrokenIncludes(ctx context.Context, domain string, visit
 			// and both are sender config errors.
 			childTxts, lookupErr := e.resolver.LookupTXT(ctx, target)
 			if lookupErr != nil {
-				// Distinguish NXDOMAIN from other errors when possible.
+				// Distinguish "not there" from other errors when possible.
+				// Go's resolver reports NXDOMAIN and NODATA (name exists,
+				// no TXT) identically, so the label must cover both.
 				cause := "lookup failed"
 				if isNXDomainErr(lookupErr) {
-					cause = "NXDOMAIN"
+					cause = voidTargetCause
 				}
 				*broken = append(*broken, brokenInclude{target: target, cause: cause})
 				continue
@@ -1013,6 +1191,7 @@ func (e *Evaluator) Stats() Stats {
 		PermErrors:        e.permErrors.Load(),
 		TempErrors:        e.tempErrors.Load(),
 		TolerantOverrides: e.tolerantOverrides.Load(),
+		TermErrorsIgnored: e.termErrorsIgnored.Load(),
 	}
 }
 
@@ -1027,6 +1206,7 @@ func (e *Evaluator) ResetStats() {
 	e.permErrors.Store(0)
 	e.tempErrors.Store(0)
 	e.tolerantOverrides.Store(0)
+	e.termErrorsIgnored.Store(0)
 }
 
 // sameSubnet checks if two IPs are in the same subnet given a prefix length.

@@ -14,3 +14,6 @@ github.com/go-sql-driver/mysql
 github.com/hashicorp/golang-lru/v2
 github.com/hashicorp/golang-lru/v2/internal
 github.com/hashicorp/golang-lru/v2/simplelru
+# golang.org/x/net v0.34.0
+## explicit; go 1.18
+golang.org/x/net/publicsuffix

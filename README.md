@@ -120,13 +120,30 @@ The whitelist file contains one domain per line. Emails from these sender domain
 |--------|---------|-------------|
 | `tolerant_mode` | `yes` | Enable heuristics to reduce false positives |
 
-When enabled, tolerant mode applies these heuristics for SPF failures:
+When enabled, tolerant mode scores these heuristics for SPF fail/softfail/permerror. An override needs 40 points for softfail/permerror and 60 for fail. Each heuristic counts at most once, and reverse DNS is only used when it is forward-confirmed (the PTR name resolves back to the client IP). "Registrable domain" uses the public suffix list, so `co.uk` never counts as a shared organisation.
 
-1. **PTR Validation**: If the sending IP has a PTR record, and that PTR domain passes SPF, allow the message
-2. **ESP Detection**: Recognize shared infrastructure from known Email Service Providers
-3. **Include Chain**: Check if SPF records reference other domains that might authorize the sender
+| Heuristic | Points |
+|-----------|--------|
+| **MX alignment** — client rDNS is in the same registrable domain as one of the sender domain's MX hosts (e.g. `*.google.com` client for a Google Workspace domain, `*.outbound.protection.outlook.com` for Microsoft 365). Decisive on its own for softfail/permerror ("match and go"). A hard fail (`-all`) needs further evidence: `-all` is the sender's explicit decision, and tolerance is only meant to absorb typos and human error. | 40 |
+| **MX subnet** — client is in the same /24 (IPv4) or /64 (IPv6) as one of the domain's MX hosts | 40 |
+| **rDNS aligned** — client rDNS is the sender domain or under it (20 if the sender domain is merely under the client's registrable domain) | 30 / 20 |
+| **HELO aligned** — HELO is the sender domain or under it (15 if only related) | 25 / 15 |
+
+For PermError, an IP explicitly listed anywhere in the record chain (ip4/ip6/include/redirect/exists) is accepted first.
 
 Accepts: `yes`, `no`, `true`, `false`, `1`, `0`, `on`, `off`
+
+#### Broken SPF records (PermError)
+
+In tolerant mode a defect in the sender's published record does not by itself fail the message:
+
+- **Unusable terms are excluded from consideration.** A misspelled mechanism (`ip:` for `ip4:`, `include.example.net` for `include:example.net`), an invalid address or CIDR, a stray token, or an unknown modifier is dropped and the rest of the record is evaluated as if the term had never been published. Nothing is guessed: `ip:192.0.2.1` is ignored, not treated as `ip4:`. The outcome is whatever the remaining terms say, so a sender that was only authorized by the broken term gets the record's `all` result. Each case is logged as `SPF record errors ignored` with the terms listed in `ignored_terms`, and a resulting reject/defer reply names them.
+- **Structural PermErrors stay PermErrors**: more than 10 MX records behind an `mx` mechanism, an `include:`/`redirect=` target with no SPF record, multiple `v=spf1` records, or a chain that exceeds the DNS lookup limit even at the raised limit of 20. These are deferred unless the client IP is listed in the record chain or the heuristics above apply.
+- **The log states the real cause.** `problem=` on the `tolerant override applied` lines, and the reply text for a deferred PermError, are derived from the SPF library's error (`spf_error=`), so a lookup-limit problem is only reported when the lookup limit was actually hit.
+
+With `tolerant_mode = no` every PermError is deferred, per RFC 7208.
+
+*Possible future feature — typo repair:* reinterpreting unambiguous typos instead of excluding them (`ip:`/`ipv4:` followed by a valid address → `ip4:`/`ip6:`, `include:include:X` → `include:X`). Not implemented by design: it means guessing the sender's intent. Seen in production: `include:include:spf.protection.outlook.com`, `ip:` and `ipv4:` in place of `ip4:`.
 
 ### Logging
 
@@ -182,6 +199,9 @@ ln -s postfix-spf-policy spf-check
 
 # With custom HELO
 ./spf-check --ip 192.0.2.1 --sender user@example.com --helo mail.example.com
+
+# Show why: the daemon's log lines (PermError cause, ignored SPF terms, overrides)
+./spf-check --ip 192.0.2.1 --sender user@example.com --verbose
 ```
 
 ### domain-check

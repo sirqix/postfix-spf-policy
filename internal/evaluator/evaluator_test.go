@@ -51,6 +51,10 @@ func TestGetDomainRoot(t *testing.T) {
 		{"three parts", "sub.example.com", "example.com"},
 		{"four parts", "a.b.example.com", "example.com"},
 		{"single part", "localhost", "localhost"},
+		{"multi-label public suffix", "mail.example.co.uk", "example.co.uk"},
+		{"public suffix itself", "co.uk", "co.uk"},
+		{"pk second-level suffix", "antispam.isp.net.pk", "isp.net.pk"},
+		{"trailing dot and case", "Alt1.ASPMX.l.google.com.", "google.com"},
 	}
 
 	for _, tc := range tests {
@@ -124,12 +128,12 @@ func TestPermErrorReason(t *testing.T) {
 			name:        "single record (genuine syntax/lookup error)",
 			domain:      "syntax-broken.example.com",
 			records:     []string{"v=spf1 ip4:not-an-ip ~all"},
-			wantSubstrs: []string{"syntax-broken.example.com", "invalid mechanism syntax", "10 lookups"},
+			wantSubstrs: []string{"syntax-broken.example.com", "invalid ip4/ip6 address"},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := permErrorReason(tc.domain, tc.records)
+			got := permErrorReason(tc.domain, tc.records, permErrorCause(spf.ErrInvalidIP))
 			for _, want := range tc.wantSubstrs {
 				if !strings.Contains(got, want) {
 					t.Errorf("permErrorReason() = %q; missing substring %q", got, want)
